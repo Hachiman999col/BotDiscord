@@ -1,5 +1,7 @@
 import { regards } from "@commands/general";
+import { generateImage } from "@commands/images";
 import { commandsMusic } from "@commands/music";
+import { ollamaCall } from "@commands/ollama";
 import { commmandsPokemon } from "@commands/pokemon";
 import { KEY_TOKENS } from "@contants/keys";
 import { Client } from "discord.js";
@@ -18,5 +20,7 @@ function main() {
   regards(client);
   commmandsPokemon(client);
   commandsMusic(client);
+  ollamaCall(client);
+  generateImage(client);
 }
 main();
