@@ -32,6 +32,8 @@ Cada vez que se agrega o quita algo de la cola, el bot responde con un **banner*
 
 El banner se **refresca cada 10 segundos** mientras suena algo: muestra una barra de progreso, el tiempo transcurrido, la duración total y **cuánto falta** para que termine la canción.
 
+Si una canción no llega a sonar (por ejemplo, porque falta `yt-dlp` o el video no está disponible), el bot **avisa en el canal** con el motivo y lo deja anotado en el banner, en vez de fallar sólo en la consola. El aviso desaparece cuando agregás algo nuevo a la cola.
+
 La cola admite hasta **10 canciones de YouTube**. Si está llena, el bot avisa y no agrega el link nuevo (podés liberar lugar con `yt delete`). Los **álbumes de Jellyfin no cuentan** para ese tope: un álbum de 100 pistas se encola completo.
 
 ## Requisitos
@@ -43,6 +45,7 @@ La cola admite hasta **10 canciones de YouTube**. Si está llena, el bot avisa y
   curl -L -o ~/.local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
   chmod +x ~/.local/bin/yt-dlp
   ```
+- Un runtime de **JavaScript** para yt-dlp: `deno`, `node` o `bun` en el `PATH`. El bot se lo pasa a yt-dlp con `--js-runtimes`; sin uno, YouTube avisa que la extracción está degradada y algunos videos fallan por "Sign in to confirm you're not a bot".
 - **libopus**, **cmake** y **pkg-config** para compilar songbird (codifica el audio a Opus). En Fedora: `sudo dnf install opus-devel cmake pkgconf-pkg-config`; en Arch: `sudo pacman -S opus cmake pkgconf`.
 - Un bot creado en el [Discord Developer Portal](https://discord.com/developers/applications).
 - El intent privilegiado **Message Content** activado en Developer Portal → Bot → Privileged Gateway Intents. Sin esto el contenido de los mensajes llega vacío y el bot no reconoce ningún comando.
@@ -68,6 +71,9 @@ DISCORD_TOKEN=tu_token_del_bot
 URL_JELLYFIN=https://jellyfin.ejemplo.com
 JELLYFIN_USER=usuario
 JELLYFIN_PASSWORD=contraseña
+# Opcional, para cuando YouTube pide iniciar sesión: una de las dos alcanza.
+YTDLP_COOKIES=/ruta/a/cookies.txt
+YTDLP_COOKIES_FROM_BROWSER=firefox
 ```
 
 El token se obtiene en Developer Portal → tu aplicación → Bot → Reset Token. El `.env` está en `.gitignore`, así que no se sube al repositorio.
@@ -75,6 +81,13 @@ El token se obtiene en Developer Portal → tu aplicación → Bot → Reset Tok
 `URL_JELLYFIN` es la base del servidor (sin `/web`). El bot inicia sesión con `POST /Users/AuthenticateByName` al arrancar e imprime `Jellyfin conectado como <usuario> (<url>)`; si falla, arranca igual y los comandos `jmusic` responden con el error (queda en consola con el prefijo `[jmusic]`).
 
 > Jellyfin 12 deshabilitó las cabeceras viejas `X-Emby-*`: el bot usa `Authorization: MediaBrowser ...` tanto para el login como para pedir los álbumes y el audio.
+
+`YTDLP_COOKIES` (archivo en formato Netscape) y `YTDLP_COOKIES_FROM_BROWSER` (`firefox`, `chrome`, etc.) se pasan a yt-dlp como `--cookies` y `--cookies-from-browser`; si están las dos, gana el archivo. Sirven cuando YouTube responde *"Sign in to confirm you're not a bot"*. Para exportar el archivo con yt-dlp:
+
+```bash
+yt-dlp --cookies-from-browser firefox --cookies cookies.txt --skip-download \
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
 
 ## Ejecución
 
@@ -146,4 +159,6 @@ cargo test
 - El banner con progreso se edita sobre el último banner enviado en el servidor, así que no se llena el canal de mensajes nuevos.
 - La cola y el estado de pausa viven en memoria: si reiniciás el bot se pierden.
 - La salida de `yt-dlp` se deduce con los codecs de symphonia habilitados en `Cargo.toml` (`mkv`/Opus, `isomp4`/AAC y `mp3`). Si un video no suena, revisá que `yt-dlp` esté actualizado.
+- Cuando una pista no arranca, el banner y un mensaje en el canal muestran el motivo (por ejemplo, YouTube pidiendo cookies o limitando las peticiones con HTTP 429).
+- Si el fallo es el chequeo anti-bot de YouTube, el bot reintenta **una vez** la misma canción con otro cliente de YouTube (`web_embedded`, que no exige PO Token) antes de darse por vencido; si vuelve a fallar, ahí sí avisa en el canal.
 - Los comandos de IA, música completa y generación de imágenes que tenía la versión anterior en TypeScript fueron eliminados en el port a Rust.

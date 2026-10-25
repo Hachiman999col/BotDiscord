@@ -14,7 +14,7 @@ use serenity::{
 use songbird::{
     events::{Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent},
     input::{HttpRequest, YoutubeDl},
-    tracks::{PlayMode, TrackHandle},
+    tracks::{PlayError, PlayMode, TrackHandle},
     Songbird,
 };
 use tokio::sync::Mutex;
@@ -27,6 +27,8 @@ const BANNER_COLOR: u32 = 0x5865F2;
 /// Cada cuánto se edita el banner para refrescar el progreso de la canción.
 const BANNER_REFRESH: Duration = Duration::from_secs(10);
 const PROGRESS_BAR_WIDTH: usize = 12;
+/// Cliente de YouTube con el que se reintenta cuando YouTube pide verificación anti-bot.
+const RETRY_CLIENT: &str = "web_embedded";
 const FULL_QUEUE_TEXT: &str =
     "La cola ya tiene 10 canciones de YouTube. Esperá a que termine alguna o borrá una con `yt delete`.";
 
@@ -48,6 +50,8 @@ struct Song {
     origin: Origin,
     /// Cabeceras extra para pedir el audio (Jellyfin usa `Authorization`).
     headers: Vec<(String, String)>,
+    /// Cliente de YouTube forzado en yt-dlp; solo se usa al reintentar un fallo.
+    ytdlp_client: Option<String>,
 }
 
 impl Song {
@@ -60,6 +64,7 @@ impl Song {
             duration_secs,
             origin: Origin::YouTube,
             headers: Vec::new(),
+            ytdlp_client: None,
         }
     }
 
@@ -77,6 +82,7 @@ impl Song {
             duration_secs,
             origin: Origin::Jellyfin,
             headers,
+            ytdlp_client: None,
         }
     }
 }
@@ -127,10 +133,78 @@ fn progress_bar(position: u64, total: u64) -> String {
         .collect()
 }
 
+/// Runtime de JavaScript que yt-dlp usa para extraer YouTube (solo detecta `deno` por su cuenta).
+/// Sin uno, la extracción queda degradada y algunos videos no se pueden bajar.
+fn js_runtime() -> Option<&'static str> {
+    static RUNTIME: OnceLock<Option<&'static str>> = OnceLock::new();
+
+    *RUNTIME.get_or_init(|| {
+        let dirs: Vec<_> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
+        ["deno", "node", "bun"]
+            .into_iter()
+            .find(|program| dirs.iter().any(|dir| dir.join(program).is_file()))
+    })
+}
+
+/// Argumentos extra para yt-dlp: runtime de JavaScript y cookies, si están configurados.
+fn ytdlp_args() -> Vec<String> {
+    let mut args = js_runtime()
+        .map(|runtime| vec!["--js-runtimes".to_owned(), runtime.to_owned()])
+        .unwrap_or_default();
+    args.extend(cookie_args());
+    args
+}
+
+/// Cookies de YouTube para yt-dlp, leídas del `.env` (`YTDLP_COOKIES` o
+/// `YTDLP_COOKIES_FROM_BROWSER`). Ayudan cuando YouTube pide iniciar sesión.
+fn cookie_args() -> Vec<String> {
+    cookie_args_for(
+        std::env::var("YTDLP_COOKIES").ok().as_deref(),
+        std::env::var("YTDLP_COOKIES_FROM_BROWSER").ok().as_deref(),
+    )
+}
+
+/// El archivo de cookies tiene prioridad: es el que no depende del navegador del host.
+fn cookie_args_for(cookies_file: Option<&str>, from_browser: Option<&str>) -> Vec<String> {
+    let file = cookies_file
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let browser = from_browser
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(file) = file {
+        vec!["--cookies".to_owned(), file.to_owned()]
+    } else if let Some(browser) = browser {
+        vec!["--cookies-from-browser".to_owned(), browser.to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Fuerza el cliente de YouTube de yt-dlp (se usa al reintentar un fallo anti-bot).
+fn client_args(song: &Song) -> Vec<String> {
+    song.ytdlp_client
+        .as_ref()
+        .map(|client| {
+            vec![
+                "--extractor-args".to_owned(),
+                format!("youtube:player_client={client}"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
 /// Construye la entrada de audio según el origen: yt-dlp o el stream HTTP de Jellyfin.
 fn input_for(song: &Song) -> songbird::input::Input {
     match song.origin {
-        Origin::YouTube => YoutubeDl::new(http_client(), song.url.clone()).into(),
+        Origin::YouTube => {
+            let mut args = ytdlp_args();
+            args.extend(client_args(song));
+            YoutubeDl::new(http_client(), song.url.clone())
+                .user_args(args)
+                .into()
+        }
         Origin::Jellyfin => jellyfin_input(song.url.clone(), song.headers.clone()),
     }
 }
@@ -173,6 +247,8 @@ pub struct GuildQueue {
     paused_total: Duration,
     /// Último banner enviado: se edita para mostrar el progreso.
     banner: Option<(ChannelId, MessageId)>,
+    /// Motivo del último fallo de reproducción, para mostrarlo en el banner.
+    failure: Option<String>,
     /// Identifica la reproducción en curso; el actualizador del banner se detiene al cambiar.
     session: u64,
 }
@@ -241,6 +317,7 @@ async fn resolve_metadata(url: &str) -> SongMeta {
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         tokio::process::Command::new("yt-dlp")
+            .args(ytdlp_args())
             .args([
                 "--no-playlist",
                 "--print",
@@ -550,6 +627,7 @@ async fn start_current(
         call.add_global_event(
             Event::Track(TrackEvent::End),
             TrackEnd {
+                ctx: ctx.clone(),
                 manager,
                 guild_id,
                 queues: queues.clone(),
@@ -633,6 +711,9 @@ async fn play_songs(
 
         if let Some(state) = queues_guard.get_mut(&guild_id) {
             if state.current.is_some() {
+                // Un comando nuevo descarta el aviso del fallo anterior.
+                state.failure = None;
+
                 let space = if respect_limit {
                     MAX_QUEUE_LEN.saturating_sub(state.youtube_pending())
                 } else {
@@ -1018,6 +1099,10 @@ fn banner_description(state: &GuildQueue) -> String {
         None => description.push_str("**Nada sonando**\n"),
     }
 
+    if let Some(failure) = &state.failure {
+        description.push_str(&format!("\n⚠️ {failure}\n"));
+    }
+
     if state.pending.is_empty() {
         description.push_str("\n_La cola está vacía._");
     } else {
@@ -1036,40 +1121,178 @@ fn banner_description(state: &GuildQueue) -> String {
 
 /// Al terminar una canción pasa a la siguiente; si no quedan, el bot se va.
 struct TrackEnd {
+    ctx: Context,
     manager: Arc<Songbird>,
     guild_id: GuildId,
     queues: Queues,
+}
+
+/// Motivo legible de un fallo de reproducción, a partir del error crudo de songbird.
+fn failure_reason(err: &PlayError) -> String {
+    failure_from_text(&err.to_string())
+}
+
+/// ¿El fallo es el chequeo anti-bot de YouTube? Ese caso se puede reintentar con otro cliente.
+fn bot_check_failure(raw: &str) -> bool {
+    let raw = raw.to_lowercase();
+    raw.contains("sign in to confirm") || raw.contains("confirm you're not a bot")
+}
+
+fn failure_from_text(raw: &str) -> String {
+    if raw.contains("could not find executable 'yt-dlp'") {
+        return "falta `yt-dlp` en el `PATH` del bot (ver los requisitos del README)".to_owned();
+    }
+
+    // "runtime error while playing track: input creation [failed to create audio: <motivo>]"
+    let detail = raw
+        .split_once("failed to create audio: ")
+        .map(|(_, detail)| detail.trim_end_matches(']').trim())
+        .unwrap_or(raw);
+
+    // yt-dlp mezcla warnings con el error real: sirve la última línea `ERROR:`.
+    let message = detail
+        .lines()
+        .rev()
+        .find_map(|line| line.split_once("ERROR: ").map(|(_, rest)| rest.trim()))
+        .unwrap_or(detail);
+
+    match hint_for(message) {
+        Some(hint) => hint.to_owned(),
+        None => shorten(message, 200),
+    }
+}
+
+/// Traduce los fallos típicos de YouTube a un motivo accionable.
+fn hint_for(message: &str) -> Option<&'static str> {
+    let message = message.to_lowercase();
+
+    if message.contains("sign in to confirm") {
+        Some(
+            "YouTube pidió confirmar que no soy un bot: configurá `YTDLP_COOKIES` en el `.env` (ver el README)",
+        )
+    } else if message.contains("http error 429") {
+        Some("YouTube limitó las peticiones (HTTP 429): esperá unos minutos y reintentá")
+    } else {
+        None
+    }
+}
+
+/// Recorta el texto para que el motivo quepa en el mensaje de Discord.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+
+    let mut short: String = text.chars().take(max - 1).collect();
+    short.push('…');
+    short
+}
+
+impl TrackEnd {
+    /// Refresca el banner con el motivo del fallo y lo manda como mensaje al canal.
+    async fn notify_failure(
+        &self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        embed: CreateEmbed,
+        message: String,
+    ) {
+        let edit = EditMessage::new()
+            .content("🎵 Cola de reproducción")
+            .embed(embed);
+        if let Err(err) = channel_id
+            .edit_message(&self.ctx.http, message_id, edit)
+            .await
+        {
+            eprintln!("[music] no se pudo actualizar el banner con el fallo: {err}");
+        }
+
+        if let Err(err) = channel_id.say(&self.ctx.http, message).await {
+            eprintln!("[music] no se pudo avisar del fallo en el canal {channel_id}: {err}");
+        }
+    }
 }
 
 #[async_trait]
 impl VoiceEventHandler for TrackEnd {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         // Los fallos de audio (por ejemplo, yt-dlp no disponible) solo se ven acá.
-        if let EventContext::Track(tracks) = ctx {
-            for (state, _) in tracks.iter() {
-                if let PlayMode::Errored(err) = &state.playing {
-                    eprintln!("[yt] la pista falló al reproducirse: {err:?}");
-                }
+        let error = match ctx {
+            EventContext::Track(tracks) => {
+                tracks.iter().find_map(|(state, _)| match &state.playing {
+                    PlayMode::Errored(err) => {
+                        eprintln!("[yt] la pista falló al reproducirse: {err:?}");
+                        Some(err)
+                    }
+                    _ => None,
+                })
             }
-        }
+            _ => None,
+        };
 
         let mut queues_guard = self.queues.lock().await;
         let state = queues_guard.get_mut(&self.guild_id)?;
 
-        let Some(next) = state.pending.pop_front() else {
+        // El chequeo anti-bot de YouTube se reintenta una vez con otro cliente antes de avisar.
+        let retry = error.is_some_and(|err| bot_check_failure(&err.to_string()))
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|song| song.ytdlp_client.is_none());
+
+        // El motivo queda en el banner y además se avisa en el mismo canal del banner.
+        let notice = if retry {
+            None
+        } else {
+            error.and_then(|err| {
+                let reason = failure_reason(err);
+                let label = state
+                    .current
+                    .as_ref()
+                    .map(song_label)
+                    .unwrap_or_else(|| "la canción actual".to_owned());
+                let failure = format!("No pude reproducir {label}: {reason}");
+                state.failure = Some(failure.clone());
+                state.banner.map(|(channel_id, message_id)| {
+                    (channel_id, message_id, banner(state), failure)
+                })
+            })
+        };
+
+        let next = if retry {
+            state.current.take().map(|mut song| {
+                song.ytdlp_client = Some(RETRY_CLIENT.to_owned());
+                song
+            })
+        } else {
+            state.pending.pop_front()
+        };
+
+        let Some(next) = next else {
             queues_guard.remove(&self.guild_id);
             drop(queues_guard);
             println!("[music] cola vacía, saliendo del canal de voz");
+            if let Some((channel_id, message_id, embed, failure)) = notice {
+                self.notify_failure(channel_id, message_id, embed, failure)
+                    .await;
+            }
             if let Err(err) = self.manager.remove(self.guild_id).await {
                 eprintln!("[yt] no se pudo salir del canal de voz: {err}");
             }
             return None;
         };
 
-        println!(
-            "[music] pista terminada, sigue: {} ({})",
-            next.title, next.url
-        );
+        if next.ytdlp_client.is_some() {
+            println!(
+                "[yt] YouTube pidió verificación; reintento {} con el cliente {RETRY_CLIENT}",
+                next.url
+            );
+        } else {
+            println!(
+                "[music] pista terminada, sigue: {} ({})",
+                next.title, next.url
+            );
+        }
         state.current = Some(next.clone());
         state.reset_timing();
 
@@ -1086,6 +1309,11 @@ impl VoiceEventHandler for TrackEnd {
 
         if let Some(state) = self.queues.lock().await.get_mut(&self.guild_id) {
             state.current_handle = Some(handle);
+        }
+
+        if let Some((channel_id, message_id, embed, failure)) = notice {
+            self.notify_failure(channel_id, message_id, embed, failure)
+                .await;
         }
 
         None
@@ -1169,6 +1397,113 @@ mod tests {
         assert!(description.contains("0:30 / 3:20"), "{description}");
         assert!(description.contains("faltan 2:50"), "{description}");
         assert!(description.contains('🔘'), "{description}");
+    }
+
+    #[test]
+    fn el_banner_muestra_el_motivo_del_fallo() {
+        let state = GuildQueue {
+            current: Some(song("Tema")),
+            failure: Some("No pude reproducir Tema: falta `yt-dlp`".to_owned()),
+            ..Default::default()
+        };
+
+        let description = banner_description(&state);
+        assert!(
+            description.contains("⚠️ No pude reproducir Tema: falta `yt-dlp`"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn traduce_el_fallo_de_ytdlp_a_un_motivo_legible() {
+        assert_eq!(
+            failure_from_text(
+                "runtime error while playing track: input creation [failed to create audio: could not find executable 'yt-dlp' on path]"
+            ),
+            "falta `yt-dlp` en el `PATH` del bot (ver los requisitos del README)"
+        );
+        assert_eq!(
+            failure_from_text(
+                "runtime error while playing track: input creation [failed to create audio: yt-dlp failed with non-zero status code: ERROR: Video unavailable]"
+            ),
+            "Video unavailable"
+        );
+        assert_eq!(
+            failure_from_text("runtime error while playing track: parsing formats/codecs [rot]"),
+            "runtime error while playing track: parsing formats/codecs [rot]"
+        );
+    }
+
+    #[test]
+    fn muestra_el_error_real_y_no_los_warnings_de_ytdlp() {
+        // Tal cual lo escupe yt-dlp cuando YouTube frena la extracción.
+        let raw = "runtime error while playing track: input creation [failed to create audio: yt-dlp failed with non-zero status code: WARNING: [youtube] jidurZRdbSg: Unable to download webpage: HTTP Error 429: Too Many Requests\nWARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default\nERROR: [youtube] jidurZRdbSg: Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies for the authentication.]";
+
+        let motivo = failure_from_text(raw);
+        assert!(
+            motivo.starts_with("YouTube pidió confirmar que no soy un bot"),
+            "{motivo}"
+        );
+        assert!(!motivo.contains("WARNING"), "{motivo}");
+
+        let limitado = failure_from_text(
+            "runtime error while playing track: input creation [failed to create audio: yt-dlp failed with non-zero status code: ERROR: Unable to download webpage: HTTP Error 429: Too Many Requests]",
+        );
+        assert!(limitado.contains("HTTP 429"), "{limitado}");
+    }
+
+    #[test]
+    fn arma_los_argumentos_de_cookies_del_env() {
+        let expected = |parts: [&str; 2]| vec![parts[0].to_owned(), parts[1].to_owned()];
+
+        assert_eq!(
+            cookie_args_for(Some("/ruta/cookies.txt"), None),
+            expected(["--cookies", "/ruta/cookies.txt"])
+        );
+        assert_eq!(
+            cookie_args_for(None, Some("firefox")),
+            expected(["--cookies-from-browser", "firefox"])
+        );
+        // El archivo gana cuando están las dos variables.
+        assert_eq!(
+            cookie_args_for(Some("/ruta/cookies.txt"), Some("firefox")),
+            expected(["--cookies", "/ruta/cookies.txt"])
+        );
+        assert!(cookie_args_for(Some("  "), None).is_empty());
+        assert!(cookie_args_for(None, None).is_empty());
+    }
+
+    #[test]
+    fn el_reintento_fuerza_otro_cliente_de_youtube() {
+        let mut tema = song("Tema");
+        assert!(client_args(&tema).is_empty());
+
+        tema.ytdlp_client = Some(RETRY_CLIENT.to_owned());
+        assert_eq!(
+            client_args(&tema),
+            vec![
+                "--extractor-args".to_owned(),
+                format!("youtube:player_client={RETRY_CLIENT}")
+            ]
+        );
+    }
+
+    #[test]
+    fn reconoce_el_fallo_anti_bot_de_youtube() {
+        assert!(bot_check_failure(
+            "yt-dlp failed with non-zero status code: ERROR: [youtube] jidurZRdbSg: Sign in to confirm you’re not a bot."
+        ));
+        assert!(!bot_check_failure(
+            "yt-dlp failed with non-zero status code: ERROR: Video unavailable"
+        ));
+    }
+
+    #[test]
+    fn recorta_los_motivos_muy_largos() {
+        let largo = shorten(&"a".repeat(500), 200);
+        assert_eq!(largo.chars().count(), 200);
+        assert!(largo.ends_with('…'));
+        assert_eq!(shorten("corto", 200), "corto");
     }
 
     #[test]
